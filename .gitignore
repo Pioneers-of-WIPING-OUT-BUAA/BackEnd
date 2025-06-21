@@ -1,0 +1,8 @@
+/.vscode
+__pycache__
+
+*.png
+*.jpg
+
+config.yaml
+db.sqlite3

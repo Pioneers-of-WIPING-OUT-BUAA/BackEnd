@@ -1,0 +1,23 @@
+stages:
+  - install
+
+cache:
+  paths:
+    - node_modules/
+
+install:
+  stage: install
+  tags:
+    - shell
+  script:
+    - cp -rf * /se/back/
+    - cd /se/back/
+    # 更安全的 tmux 会话管理
+    - tmux has-session -t se-back 2>/dev/null && tmux kill-session -t se-back || true
+    - tmux new-session -s se-back -d  # 创建分离的会话
+    - tmux send-keys -t se-back 'conda activate back && cd /se/back && python manage.py runserver 0.0.0.0:8000 2>&1 | tee -a server.log' C-m  # 发送命令并执行
+    # 添加健康检查
+    - sleep 5  # 给服务器启动时间
+    - pgrep -f "python manage.py runserver" || { echo "Server failed to start"; exit 1; }
+
+
