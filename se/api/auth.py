@@ -18,6 +18,9 @@ def register(request: HttpRequest):
     """
     data = parse_data(request)
     username = data["username"]
+    if not isinstance(username, str) or not 1 <= len(username.strip()) <= 50 \
+            or not isinstance(data["password"], str) or not 1 <= len(data["password"]) <= 128:
+        return failed_api_response(ErrorCode.INVALID_REQUEST_ARGS, "用户名或密码无效")
     
     if User.objects.filter(username=username).exists():
         return failed_api_response(ErrorCode.BAD_REQUEST_ERROR, "用户名已被注册")
@@ -40,6 +43,8 @@ def login(request: HttpRequest):
     data = parse_data(request)
     username = data["username"]
     password = data["password"]
+    if not isinstance(username, str) or not isinstance(password, str):
+        return failed_api_response(ErrorCode.INVALID_REQUEST_ARGS, "用户名或密码无效")
 
     try:
         user = User.objects.get(username=username)
@@ -75,6 +80,8 @@ def update_password(request: HttpRequest):
     data = parse_data(request)
     origin_pwd = data["old_pwd"]
     new_pwd = data["new_pwd"]
+    if not isinstance(origin_pwd, str) or not isinstance(new_pwd, str) or not 1 <= len(new_pwd) <= 128:
+        return failed_api_response(ErrorCode.INVALID_REQUEST_ARGS, "密码无效")
     user = get_user(request)
 
     if not check_password(origin_pwd, user.password):
@@ -92,5 +99,4 @@ def update_password(request: HttpRequest):
 #     [GET] /api/auth/check_username/<str:username>
 #     """
 #     return success_api_response({"exist": User.objects.filter(username=username).exists()})
-
 

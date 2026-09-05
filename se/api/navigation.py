@@ -29,6 +29,7 @@ from se.util_normal import (
     require_keys,
     parse_data,
     require_item_exist,
+    is_finite_number,
 )
 
 from roslibpy.core import RosTimeoutError
@@ -59,10 +60,11 @@ def start_nav(request: HttpRequest, query_id):
     template['navigation_ctrl_msg']['name_list'].append(map_obj.name)
 
     ros_client = ROSClient()
-    ros_client.map_id = map_obj.id
-
     user = get_user(request)
-    return use_ros(template, user)
+    response = use_ros(template, user)
+    if response["success"]:
+        ros_client.map_id = map_obj.id
+    return response
 
 
 @response_wrapper
@@ -77,7 +79,10 @@ def end_nav(request: HttpRequest):
     template["type"] = CtrlType.NAV_END.value
 
     user = get_user(request)
-    return use_ros(template, user)
+    response = use_ros(template, user)
+    if response["success"]:
+        ROSClient().map_id = 0
+    return response
 
 
 # def move(request: HttpRequest):
@@ -96,24 +101,24 @@ def patrol(request: HttpRequest):
     [POST] /api/navigation/patrol
     """
     data = parse_data(request)
-    for pid in data["path"]:
-        if not Point.objects.filter(id=pid).exists():
-            return failed_api_response(ErrorCode.INVALID_REQUEST_ARGUMENT_ERROR, f"航点(ID:{pid})不存在")
-    
-    path_name = []
-    path_pos = []
-    for pid in data["path"]:
-        name = pid2name(pid)
-        pos = pid2pos(pid)
-        path_name.append(name)
-        path_pos.append(pos)
-    
-    # loop = data["loop"]
+    path = data["path"]
+    loop = data.get("loop", 0)
+    if not isinstance(path, list) or not 1 <= len(path) <= 500 \
+            or any(type(pid) is not int or pid <= 0 for pid in path):
+        return failed_api_response(ErrorCode.INVALID_REQUEST_ARGS, "请提供有效航点列表")
+    if type(loop) is not int or loop not in (0, 1):
+        return failed_api_response(ErrorCode.INVALID_REQUEST_ARGS, "循环模式只能为0或1")
+    map_id = ROSClient().map_id
+    if not map_id or data.get("map", map_id) != map_id:
+        return failed_api_response(ErrorCode.INVALID_REQUEST_ARGS, "请先选择正确的导航地图")
+    points = Point.objects.filter(mmap_id=map_id).in_bulk(path)
+    if any(pid not in points for pid in path):
+        return failed_api_response(ErrorCode.INVALID_REQUEST_ARGS, "航点不存在或不属于当前地图")
     template = ctrl_template()
     template["type"] = CtrlType.NAV_PATROL.value
-    template["navigation_ctrl_msg"]["name_list"] = path_name   
-    template["navigation_ctrl_msg"]["pose_list"] = path_pos
-    template["navigation_ctrl_msg"]["loop"] = 1
+    template["navigation_ctrl_msg"]["name_list"] = [points[pid].name for pid in path]
+    template["navigation_ctrl_msg"]["pose_list"] = [points[pid].pose for pid in path]
+    template["navigation_ctrl_msg"]["loop"] = loop
 
     user = get_user(request)
     return use_ros(template, user)
@@ -136,23 +141,25 @@ def stop_nav(request: HttpRequest):
 @response_wrapper
 @require_jwt()
 @require_POST
-# @require_keys({"name", "x", "y", "theta"})
-# @require_item_exist(Map, "id", "query_id")
+@require_keys({"name", "x", "y", "theta"})
+@require_item_exist(Map, "id", "query_id")
 def mark_point(request: HttpRequest, query_id):
     """
     [POST] /api/navigation/mark/<int:query_id>
     """
     data = parse_data(request)
-    print(data)
     name = data["name"]
+    if not isinstance(name, str) or not 1 <= len(name.strip()) <= 50 \
+            or not all(is_finite_number(data[key]) for key in ("x", "y", "theta")):
+        return failed_api_response(ErrorCode.INVALID_REQUEST_ARGS, "航点名称或坐标无效")
 
-    if Point.objects.filter(mmap=Map.objects.get(id=query_id), name=name).exists():
+    if Point.objects.filter(mmap_id=query_id, name=name).exists():
         return failed_api_response(ErrorCode.INVALID_REQUEST_ARGUMENT_ERROR, "航点名称已存在")
 
     pos = ros_wrap_point(data["x"], data["y"], data["theta"])
 
     point = Point.objects.create(
-        mmap = Map.objects.get(id=query_id),
+        mmap_id = query_id,
         name = name,
         px = pos['position']['x'],
         py = pos['position']['y'],
@@ -176,14 +183,15 @@ def rename_point(request: HttpRequest):
     [POST] /api/navigation/rename
     """
     data = parse_data(request)
-
-    if not Point.objects.filter(id=data["id"]).exists():
+    if type(data["id"]) is not int or not isinstance(data["name"], str) or not 1 <= len(data["name"].strip()) <= 50:
+        return failed_api_response(ErrorCode.INVALID_REQUEST_ARGS, "航点编号或名称无效")
+    point = Point.objects.filter(id=data["id"]).first()
+    if point is None:
         return failed_api_response(ErrorCode.ITEM_NOT_FOUND_ERROR, "航点不存在")
 
-    if Point.objects.filter(name=data["name"]).exists():
+    if Point.objects.filter(mmap_id=point.mmap_id, name=data["name"]).exclude(id=point.id).exists():
         return failed_api_response(ErrorCode.INVALID_REQUEST_ARGUMENT_ERROR, "目标航点名称已存在")
 
-    point = Point.objects.filter(id=data["id"]).first()
     point.name = data["name"]
     point.save()
     return success_api_response()
@@ -191,6 +199,7 @@ def rename_point(request: HttpRequest):
 
 @response_wrapper
 @require_jwt()
+@require_http_methods(["DELETE"])
 @require_item_exist(Point, "id", "query_id")
 def delete_point(request: HttpRequest, query_id):
     """
@@ -213,9 +222,12 @@ def get_map_list(request: HttpRequest):
             "id": map_obj.id,
             "name": map_obj.name,
             "url": oss_download_url(map_obj.file.oss_token),
+            "x": map_obj.x,
+            "y": map_obj.y,
+            "resolution": map_obj.resolution,
         }
 
-    data = {"maps": list(map(map2dict, Map.objects.all()))}
+    data = {"maps": list(map(map2dict, Map.objects.select_related("file").all()))}
     return success_api_response(data)
 
 
@@ -240,13 +252,8 @@ def get_point_list(request: HttpRequest, query_id):
                 "w": point_obj.ow,
             })
         }
-    map_obj = Map.objects.get(id=query_id)
-    if not Point.objects.filter(mmap=map_obj).exists():
-        point_list = []
-    else:
-        point_list = list(Point.objects.filter(mmap=map_obj))
+    point_list = Point.objects.filter(mmap_id=query_id).order_by("id")
 
     data = {"points": list(map(point2dict, point_list))}
     return success_api_response(data)
-
 

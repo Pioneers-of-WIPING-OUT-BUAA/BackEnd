@@ -17,3 +17,4 @@ class Map(models.Model):
     updated_at = models.DateTimeField(default=timezone.now)
     x = models.FloatField(default=0.0)
     y = models.FloatField(default=0.0)
+    resolution = models.FloatField(default=0.03)

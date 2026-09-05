@@ -1,4 +1,7 @@
 import json
+import math
+import re
+from functools import wraps
 from enum import unique, Enum
 
 import jwt
@@ -8,6 +11,8 @@ from django.views.decorators.http import require_http_methods
 
 from se.models.User import ROLE_ADMIN, User
 from backend import settings
+from se.exceptions import ExternalServiceError, InvalidInputError
+from roslibpy.core import RosTimeoutError
 
 
 @unique
@@ -33,6 +38,8 @@ class ErrorCode(Enum):
     ITEM_ALREADY_EXIST_ERROR = 404_02
     # 与ROS建立连接失败
     ROS_CONNECT_FAILED = 500_01
+    UPSTREAM_ERROR = 502_00
+    TOO_MANY_REQUESTS = 429_00
 
 
 def _api_response(success, data) -> dict:
@@ -83,8 +90,14 @@ def response_wrapper(func):
     :return: wrapped function
     """
 
+    @wraps(func)
     def _inner(*args, **kwargs):
-        _response = func(*args, **kwargs)
+        try:
+            _response = func(*args, **kwargs)
+        except (ExternalServiceError, RosTimeoutError):
+            _response = failed_api_response(ErrorCode.UPSTREAM_ERROR, "外部服务调用失败，请稍后重试")
+        except InvalidInputError as exc:
+            _response = failed_api_response(ErrorCode.INVALID_REQUEST_ARGS, str(exc))
         if isinstance(_response, dict):
             if _response['success']:
                 _response = JsonResponse(_response['data'])
@@ -106,6 +119,7 @@ def require_jwt(admin=False):
     """
 
     def decorator(view_func):
+        @wraps(view_func)
         def _wrapped_view(request: HttpRequest, *args, **kwargs):
             try:
                 auth = request.META.get('HTTP_AUTHORIZATION').split(" ")
@@ -127,8 +141,11 @@ def require_jwt(admin=False):
                 if username is None or role is None:
                     return failed_api_response(ErrorCode.INVALID_REQUEST_ARGUMENT_ERROR, "无效的token")
 
-                # 没有用
-                if admin and role != ROLE_ADMIN:
+                user = User.objects.filter(username=username).first()
+                if user is None:
+                    return failed_api_response(ErrorCode.TOKEN_EXPIRED, "用户不存在，请重新登录")
+                request.se_user = user
+                if admin and user.role != ROLE_ADMIN:
                     return failed_api_response(ErrorCode.BAD_REQUEST_ERROR, "需要管理员权限")
 
                 return view_func(request, *args, **kwargs)
@@ -207,10 +224,13 @@ def parse_data(request: HttpRequest):
     :param request: HttpRequest
     :return: request body dict if success else None
     """
-    try:
-        return json.loads(request.body.decode())
-    except json.JSONDecodeError:
-        return None
+    if not hasattr(request, "_se_json_data"):
+        try:
+            data = json.loads(request.body.decode("utf-8"))
+            request._se_json_data = data if isinstance(data, dict) else None
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            request._se_json_data = None
+    return request._se_json_data
 
 
 def require_keys(key_set: set):
@@ -221,6 +241,7 @@ def require_keys(key_set: set):
     """
 
     def decorator(func):
+        @wraps(func)
         def wrapper(request: HttpRequest, *args, **kwargs):
             data = parse_data(request)
             if data is None:
@@ -273,8 +294,22 @@ def get_user(request: HttpRequest) -> User:
     :param request: HttpRequest
     :return: user
     """
+    if hasattr(request, "se_user"):
+        return request.se_user
     auth = request.META.get('HTTP_AUTHORIZATION').split(" ")
     dic = jwt.decode(auth[1], settings.SECRET_KEY, algorithms='HS256')
     username = dic.get("username", None)
     user = User.objects.get(username=username)
+    request.se_user = user
     return user
+
+
+def is_finite_number(value):
+    try:
+        return type(value) in (int, float) and math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def valid_map_name(value):
+    return isinstance(value, str) and re.fullmatch(r"[\w-]{1,100}", value) is not None

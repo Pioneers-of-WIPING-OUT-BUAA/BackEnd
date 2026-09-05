@@ -22,6 +22,14 @@ AI 请求使用 `https://openrouter.ai/api/v1`，默认模型为 `qwen/qwen3-vl-
 ROS 测试环境及消息编译方法见相邻 `RosEnd` 仓库的 `environment.yml` 和 README。
 本机需要代理时可先执行 `source /etc/profile.d/clash.sh`，再执行 `proxy_on`。
 
+日志列表支持 `GET /api/log/list?page=1&page_size=50`，返回 `logs`、`total`、`page`、
+`page_size`；每页最多 100 条。空日志返回 `{"log": null}`。
+识别上传的 multipart 表单需包含 JPEG `file` 与 JSON 数组 `pos`（三个有限数值）。
+没有已登记人脸时，识别结果的 `stranger` 为 `null`，表示未执行该项识别。
+导航 `loop=0` 表示单次巡逻，`loop=1` 表示持续循环，航点必须属于当前地图。
+地图列表附带原点 `x`、`y` 和 `resolution`；启动前执行迁移以补充该字段。
+机器人连接与识别开关由当前进程管理，当前部署应使用一个后端进程。
+
 本项目是"扫荡北航前锋"机器人项目的后端服务器，基于 Django REST Framework 构建。它不仅为前端应用提供了功能丰富的 API 接口，更重要的是，它扮演着连接用户与 ROS (机器人操作系统) 的核心桥梁，实现了对机器人的远程状态监控、任务下发与精细控制。
 
 ## 主要功能

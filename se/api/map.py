@@ -1,7 +1,10 @@
 import time
 import os
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from django.db import transaction
 from django.http import HttpRequest
-from django.views.decorators.http import require_GET, require_POST
+from django.views.decorators.http import require_GET, require_POST, require_http_methods
 from se.util_ros import (
     ROSClient, 
     check_connect, 
@@ -24,6 +27,8 @@ from se.util_normal import (
     require_keys,
     parse_data,
     require_item_exist,
+    is_finite_number,
+    valid_map_name,
 )
 
 from roslibpy.core import RosTimeoutError
@@ -79,9 +84,11 @@ def save_map(request: HttpRequest):
     """
     data = parse_data(request)
     name = data["name"]
+    if not valid_map_name(name):
+        return failed_api_response(ErrorCode.INVALID_REQUEST_ARGS, "地图名只能包含字母、数字、汉字、下划线和连字符，长度不超过100")
 
     if Map.objects.filter(name=name).exists():
-        return failed_api_response(ErrorCode.ITEM_ALREADY_EXISTS, "地图名称已存在")
+        return failed_api_response(ErrorCode.ITEM_ALREADY_EXIST_ERROR, "地图名称已存在")
     
     template = ctrl_template()
     template["type"] = CtrlType.MAPPING_SAVE_MAP.value
@@ -92,27 +99,17 @@ def save_map(request: HttpRequest):
         return res
     
     ros_client = ROSClient()
-    ros_client.save_map_local(name)
-
-    # file_data = {}
     filename = "{}.png".format(name)
     oss_token = get_oss_token(0, filename)
-
-
-    oss_upload_local_file(filename, oss_token)
-
-    if not DEBUG:
-        os.remove(filename)
-    
-    file_obj = File.objects.create(
-        filename=filename,
-        oss_token=oss_token,
-    )
-
-    map_obj = Map.objects.create(
-        file=file_obj,
-        name=name,
-    )
+    with TemporaryDirectory(prefix="ros-map-") as directory:
+        info = ros_client.save_map_local(name, directory)
+        oss_upload_local_file(str(Path(directory) / filename), oss_token)
+    with transaction.atomic():
+        file_obj = File.objects.create(filename=filename, oss_token=oss_token)
+        origin = info["origin"]["position"]
+        map_obj = Map.objects.create(
+            file=file_obj, name=name, x=origin["x"], y=origin["y"], resolution=info["resolution"],
+        )
 
     return success_api_response({
         "id": map_obj.id,
@@ -138,10 +135,10 @@ def map_move(request: HttpRequest):
 
     if dir == "g":
         return failed_api_response(ErrorCode.INVALID_REQUEST_ARGS, "建图模式下你抓取什么啊？")
-    if DIRECTION.get(dir, None) is None:
+    if not isinstance(dir, str) or DIRECTION.get(dir, None) is None:
         return failed_api_response(ErrorCode.INVALID_REQUEST_ARGS, "方向走错了，一切努力都是徒劳")
 
-    if not -1e-6 <= speed <= 0.3 + 1e-6:
+    if not is_finite_number(speed) or not 0 <= speed <= 0.3 + 1e-6:
         return failed_api_response(ErrorCode.INVALID_REQUEST_ARGUMENT_ERROR, "速度超过合理范围了")
     
     template["keyboard_ctrl_msg"]["direction"] = DIRECTION[dir]
@@ -152,6 +149,7 @@ def map_move(request: HttpRequest):
 
 @response_wrapper
 @require_jwt()
+@require_http_methods(["DELETE"])
 def delete_map(request: HttpRequest, map_id):
     """
     [DELETE] /api/mapping/delete
@@ -168,6 +166,8 @@ def change_map_init(request: HttpRequest):
     [POST] /api/mapping/origin
     """
     data = parse_data(request)
+    if not isinstance(data["name"], str) or not all(is_finite_number(data[key]) for key in ("x", "y")):
+        return failed_api_response(ErrorCode.INVALID_REQUEST_ARGS, "地图名称或坐标无效")
     if not Map.objects.filter(name=data["name"]).exists():
         return failed_api_response(ErrorCode.ITEM_NOT_FOUND_ERROR, "地图不存在")
     

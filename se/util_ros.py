@@ -1,5 +1,9 @@
 import math
 import time
+from functools import wraps
+from pathlib import Path
+from threading import RLock
+from collections.abc import Mapping
 
 import cv2
 import numpy as np
@@ -8,7 +12,8 @@ from django.http import HttpRequest
 from roslibpy import ServiceRequest
 
 from se.util_normal import get_user, failed_api_response, ErrorCode
-from backend.settings import ROS_PORT, ROS_HOST
+from backend.settings import ROS_PORT, ROS_HOST, ROS_SERVICE_TIMEOUT
+from se.exceptions import ExternalServiceError
 
 from enum import unique, Enum
 
@@ -21,30 +26,17 @@ from se.util_normal import success_api_response
 
 def check_connect(user: User):
     ros_client = ROSClient()
-
-    # 若client尚未建立，则建立
-    if ros_client.client is None:
-        try:
-            ros_client.reset(host=ROS_HOST, port=ROS_PORT, user_id=user.id)
-        except RosTimeoutError:
+    with ros_client.lock:
+        if ros_client.client is None:
+            try:
+                ros_client.reset(host=ROS_HOST, port=ROS_PORT, user_id=user.id)
+            except RosTimeoutError:
+                return False
+        if not ros_client.is_connect:
+            ros_client.failed_count += 1
             return False
-    
-    # 确保client建立后进行连接，共有15次尝试机会
-    count = 15
-    while not ros_client.is_connect and count >= 0:
-        time.sleep(0.15)
-        count -= 1
-    
-    # 如果还是没连上，记连接失败
-    if not ros_client.is_connect:
-        ros_client.failed_count += 1
-        # 如果3次都连接失败，则断开
-        if ros_client.failed_count >= 3:
-            ros_client.exit()
-            return False
-    
-    ros_client.failed_count = 0
-    return True
+        ros_client.failed_count = 0
+        return True
 
 
 def use_ros(ctrl_msg, user):
@@ -54,6 +46,8 @@ def use_ros(ctrl_msg, user):
 
     res = ros_client.send_ctrl_req(ctrl_msg)
 
+    if not isinstance(res, Mapping) or "code" not in res:
+        raise ExternalServiceError("Invalid ROS control response.")
     if res["code"] != 0:
         print(f"[debug] ros_client.send_ctrl_req failed: {res}\nctrl_msg: {ctrl_msg}")
         return failed_api_response(ErrorCode.INVALID_REQUEST_ARGS, res["msg"])
@@ -115,26 +109,32 @@ DIRECTION = {
 class ROSClient(object):
     _instance = None
     _flag = False
+    _creation_lock = RLock()
 
     def __new__(cls, *args, **kwargs):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
+        with cls._creation_lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
         return cls._instance
 
     def __init__(self):
-        if not ROSClient._flag:
-            ROSClient._flag = True
-            self.counter = 0
-            self.failed_count = 0
-            self.map_id = 0
-            self.user_id = 0
-            self.last_op_time = time.time()
-            self.client = None
-            self.map_service = None
-            self.current_pose_service = None
-            self.main_ctrl_service = None
+        with self._creation_lock:
+            if not ROSClient._flag:
+                self.lock = RLock()
+                self.counter = 0
+                self.failed_count = 0
+                self.map_id = 0
+                self.user_id = 0
+                self.last_op_time = 0
+                self.client = None
+                self.map_service = None
+                self.current_pose_service = None
+                self.main_ctrl_service = None
+                ROSClient._flag = True
 
     def reset(self, host, port, user_id):
+        if self.client is not None:
+            self.exit()
         self.counter = 0
         self.failed_count = 0
         self.map_id = 0
@@ -143,10 +143,13 @@ class ROSClient(object):
         self.map_service = roslibpy.Service(self.client, "/dynamic_map", "nav_msgs/GetMap")
         self.main_ctrl_service = roslibpy.Service(self.client, "/master_node", "Aft_g1/MasterNode")
         self.current_pose_service = roslibpy.Service(self.client, "/cur_pose", "Aft_g1/PoseSrv")
-        self.client.run()
+        self.last_op_time = time.time()
+        self.client.run(timeout=ROS_SERVICE_TIMEOUT)
 
     def exit(self):
-        self.client.terminate()
+        if self.client is not None:
+            # Closing a connection must not stop Twisted's process-wide reactor.
+            self.client.close(timeout=ROS_SERVICE_TIMEOUT)
         self.counter = 0
         self.failed_count = 0
         self.map_id = 0
@@ -155,6 +158,7 @@ class ROSClient(object):
         self.client = None
         self.map_service = None
         self.main_ctrl_service = None
+        self.current_pose_service = None
 
     @property
     def is_connect(self):
@@ -162,23 +166,20 @@ class ROSClient(object):
             return False
         return self.client.is_connected
 
-    def save_map_local(self, name):
-        response = self.map_service.call(ServiceRequest({}))
-        width = response["map"]["info"]["height"]
-        height = response["map"]["info"]["width"]
-        m = response["map"]["data"]
-        m = np.array(m).reshape((width, height))
-        tem = np.zeros((width, height))
-        for i in range(width):
-            for j in range(height):
-                if m[i, j] == -1:
-                    tem[width - 1 - i, j] = 127
-                else:
-                    tem[width - 1 - i, j] = 255 - (m[i, j] * 2)
-        cv2.imwrite("./{}.png".format(name), tem)
+    def save_map_local(self, name, directory="."):
+        response = self.map_service.call(ServiceRequest({}), timeout=ROS_SERVICE_TIMEOUT)
+        info = response["map"]["info"]
+        height, width = info["height"], info["width"]
+        if height <= 0 or width <= 0 or len(response["map"]["data"]) != height * width:
+            raise ExternalServiceError("ROS returned an invalid map.")
+        grid = np.asarray(response["map"]["data"], dtype=np.int16).reshape(height, width)
+        pixels = np.flipud(np.where(grid == -1, 127, 255 - 2 * grid)).astype(np.uint8)
+        if not cv2.imwrite(str(Path(directory) / f"{name}.png"), pixels):
+            raise ExternalServiceError("Map image could not be written.")
+        return info
 
     def get_current_pose(self):
-        response = self.current_pose_service(ServiceRequest({}))
+        response = self.current_pose_service.call(ServiceRequest({}), timeout=ROS_SERVICE_TIMEOUT)
         return response["pose"]
 
     def send_ctrl_req(self, req: dict):
@@ -231,9 +232,11 @@ class ROSClient(object):
         :param req: dict
         :return: None
         """
-        req["id"] = self.counter
-        self.counter += 1
-        return self.main_ctrl_service.call(ServiceRequest(req))
+        with self.lock:
+            req["id"] = self.counter
+            self.counter += 1
+            self.last_op_time = time.time()
+            return self.main_ctrl_service.call(ServiceRequest(req), timeout=ROS_SERVICE_TIMEOUT)
 
 
 def ctrl_template() -> dict:
@@ -286,14 +289,18 @@ def ros_theta_to_quaternion(theta: float):
 
 
 def require_ros(func):
+    @wraps(func)
     def wrapper(request: HttpRequest, *args, **kwargs):
         user = get_user(request)
         ros_client = ROSClient()
-        if ros_client.client is None:
-            ros_client.reset(host=ROS_HOST, port=ROS_PORT, user_id=user.id)
-        if ros_client.client is not None and ros_client.user_id != user.id \
-                and time.time() - ros_client.last_op_time < 300:
-            return failed_api_response(ErrorCode.BAD_REQUEST_ERROR, "暂时无机器人可用，请稍候")
+        with ros_client.lock:
+            if ros_client.client is not None and ros_client.user_id != user.id \
+                    and time.time() - ros_client.last_op_time < 300:
+                return failed_api_response(ErrorCode.BAD_REQUEST_ERROR, "暂时无机器人可用，请稍候")
+            if not check_connect(user):
+                return failed_api_response(ErrorCode.ROS_CONNECT_FAILED, "ROS连接失败")
+            ros_client.user_id = user.id
+            ros_client.last_op_time = time.time()
         return func(request, *args, **kwargs)
 
     return wrapper
@@ -342,9 +349,9 @@ def pid2pos(pid: int) -> dict:
 def point2pos(point: Point) -> dict:
     res = {}
     res["position"] = {
-        "x": point.x,
-        "y": point.y,
-        "z": point.z,
+        "x": point.px,
+        "y": point.py,
+        "z": point.pz,
     }
     res["orientation"] = {
         "x": point.ox,
@@ -353,4 +360,3 @@ def point2pos(point: Point) -> dict:
         "w": point.ow,
     }
     return res
-

@@ -24,6 +24,7 @@ from se.util_normal import (
     require_keys,
     parse_data,
     require_item_exist,
+    is_finite_number,
 )
 
 from roslibpy.core import RosTimeoutError
@@ -48,10 +49,10 @@ def keyboard_ctrl(request: HttpRequest):
     dir = data["direction"]
     speed = data["speed"]
 
-    if DIRECTION.get(dir, None) is None:
+    if not isinstance(dir, str) or DIRECTION.get(dir, None) is None:
         return failed_api_response(ErrorCode.INVALID_REQUEST_ARGS, "方向走错了，一切努力都是徒劳")
 
-    if not -1e-6 <= speed <= 0.3 + 1e-6:
+    if not is_finite_number(speed) or not 0 <= speed <= 0.3 + 1e-6:
         return failed_api_response(ErrorCode.INVALID_REQUEST_ARGUMENT_ERROR, "速度超过合理范围了")
     
     template["keyboard_ctrl_msg"]["direction"] = DIRECTION[dir]
@@ -78,6 +79,8 @@ def command_ctrl(request: HttpRequest):
     
     data = parse_data(request)
     command = data["command"]
+    if not isinstance(command, str) or not 1 <= len(command.strip()) <= 500:
+        return failed_api_response(ErrorCode.INVALID_REQUEST_ARGS, "语音指令无效或过长")
 
     # template["command"] = command
 
@@ -119,4 +122,3 @@ def command_ctrl(request: HttpRequest):
     template["keyboard_ctrl_msg"]["speed"] = speed
 
     return use_ros(template, get_user(request))
-

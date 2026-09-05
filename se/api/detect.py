@@ -1,83 +1,84 @@
-import time
-import os
+import json
+import logging
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from threading import BoundedSemaphore, Lock
+
+from django.db import transaction
 from django.http import HttpRequest
-from django.views.decorators.http import require_GET, require_POST
-from se.util_ros import (
-    ROSClient, 
-    check_connect, 
-    require_ros,
-    ctrl_template,
-    CtrlType,
-    use_ros,
-    DIRECTION
-)
+from django.views.decorators.http import require_GET, require_POST, require_http_methods
+from PIL import Image, UnidentifiedImageError
 
 from se.api.qwen_api import detect_fire, detect_smoke, detect_stranger, detect_rubbish
-
-from backend.settings import DEBUG, LOGFLAG
-
-from se.util_normal import (
-    success_api_response,
-    failed_api_response,
-    require_jwt,
-    response_wrapper,
-    get_user,
-    ErrorCode,
-    require_keys,
-    parse_data,
-    require_item_exist,
-)
-
-from roslibpy.core import RosTimeoutError
-
-from se.models.Map import Map
-from se.models.User import User
-from se.models.File import File
+from se.exceptions import InvalidInputError
 from se.models.Face import Face
+from se.models.File import File
 from se.models.Log import Log
-
-from se.util_oss import (
-    oss_download_url,
-    get_oss_token,
-    oss_upload_local_file,
+from se.util_normal import (
+    success_api_response, failed_api_response, require_jwt, response_wrapper,
+    ErrorCode, require_item_exist, is_finite_number,
 )
+from se.util_oss import oss_download_url, get_oss_token, oss_upload_local_file, delete_object
 
-from concurrent.futures import ThreadPoolExecutor
+
+LOGFLAG = False
+_log_lock = Lock()
+_detection_slots = BoundedSemaphore(2)
+_executor = ThreadPoolExecutor(max_workers=8)
+logger = logging.getLogger(__name__)
+
+
+def _save_jpeg(upload, directory):
+    if upload is None or upload.size > 8 * 1024 * 1024:
+        raise InvalidInputError("请上传不超过8MB的JPEG图片")
+    try:
+        with Image.open(upload) as image:
+            if image.format != "JPEG" or image.width * image.height > 20000000:
+                raise InvalidInputError("请上传有效JPEG图片")
+            image.verify()
+    except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
+        raise InvalidInputError("图片内容无效") from exc
+    upload.seek(0)
+    path = Path(directory) / "image.jpg"
+    with path.open("wb") as target:
+        for chunk in upload.chunks():
+            target.write(chunk)
+    return str(path)
+
+
+def _remove_unreferenced_image(token):
+    try:
+        delete_object(token)
+    except Exception:
+        logger.exception("Failed to remove an unused detection image")
+
 
 @response_wrapper
 @require_jwt()
 @require_POST
 def upload_face(request: HttpRequest, name: str):
-    """
-    [POST] /api/face/upload/<str:name>
-    """
-    file = request.FILES.get("file")
-    if not file.name.endswith(".jpg"):
-        return failed_api_response(ErrorCode.INVALID_REQUEST_ARGS, "目前只支持jpg格式的图片")
-    
-    with open("tmp.jpg", "wb") as f:
-        for line in file.chunks():
-            f.write(line)
-    
-    new_file = "{}.jpg".format(name)
-
-    file_name = new_file
-    oss_token = get_oss_token(0, file_name)
-    oss_upload_local_file("tmp.jpg", oss_token=oss_token)
-
-    file_obj = File.objects.create(filename=file_name, oss_token=oss_token)
-    face_obj = Face.objects.create(name=name, file=file_obj, in_white_list=True)
-
-    return success_api_response(data={"id": face_obj.id})
+    if not 1 <= len(name.strip()) <= 50:
+        raise InvalidInputError("人脸名称无效")
+    token = get_oss_token(0, f"{name}.jpg")
+    with TemporaryDirectory(prefix="ros-face-") as directory:
+        path = _save_jpeg(request.FILES.get("file"), directory)
+        oss_upload_local_file(path, token)
+    try:
+        with transaction.atomic():
+            file_obj = File.objects.create(filename=f"{name}.jpg", oss_token=token)
+            face = Face.objects.create(name=name, file=file_obj, in_white_list=True)
+    except Exception:
+        _remove_unreferenced_image(token)
+        raise
+    return success_api_response({"id": face.id})
 
 
 @response_wrapper
 @require_jwt()
+@require_http_methods(["DELETE"])
 @require_item_exist(Face, "id", "query_id")
 def delete_face(request: HttpRequest, query_id):
-    """
-    [DELETE] /api/face/delete/<int:query_id>
-    """
     Face.objects.get(id=query_id).delete()
     return success_api_response()
 
@@ -86,179 +87,79 @@ def delete_face(request: HttpRequest, query_id):
 @require_jwt()
 @require_GET
 def get_face_list(request: HttpRequest):
-    """
-    [GET] /api/face/list
-    """
-    def face2dict(face: Face) -> dict:
-        return {
-            "id": face.id,
-            "name": face.name,
-            "url": oss_download_url(face.file.oss_token),
-        }
-    
-    faces = Face.objects.filter(in_white_list=True)
-    res = {
-        "faces": list(map(face2dict, faces))
-    }
-    return success_api_response(res)
-
+    faces = Face.objects.filter(in_white_list=True).select_related("file")
+    return success_api_response({"faces": [
+        {"id": face.id, "name": face.name, "url": oss_download_url(face.file.oss_token)}
+        for face in faces
+    ]})
 
 
 @response_wrapper
 @require_POST
 def detect(request: HttpRequest):
-    """
-    [POST] /api/detect/upload
-    """
     if not LOGFLAG:
-        return success_api_response({
-            "fire": False,
-            "smoke": False,
-            "stranger": False,
-            "rubbish": False,
-        })
-    
-    # print(request)  
-    # data = parse_data(request)
-    # pos = data['pos']
-    import random
-    p = random.random()
-    if p < 0.05:
-        x = random.uniform(-2, -1)
-    elif p < 0.2:
-        x = random.uniform(-1, 0)
-    elif p < 0.7:
-        x = random.uniform(0, 1)
-    else:
-        x = random.uniform(1, 2)
-
-    p = random.random()
-    if p < 0.05:
-        y = random.uniform(-3, -1)
-    elif p < 0.2:
-        y = random.uniform(-1, 0)
-    elif p < 0.7:
-        y = random.uniform(0, 1)
-    else:
-        y = random.uniform(1, 3)    
-
-
-
-    now_time = time.time()
-
-    file = request.FILES.get("file")
-    if not file.name.endswith(".jpg"):
-        return failed_api_response(ErrorCode.INVALID_REQUEST_ARGS, "目前只支持jpg格式的图片")
-    
-    with open("detect.jpg", "wb") as f:
-        for line in file.chunks():
-            f.write(line)
-
-    tmp_oss_token = "0/1749531183635/114514.jpg"
-
-    oss_upload_local_file("detect.jpg", oss_token=tmp_oss_token)
-    detect_url = oss_download_url(tmp_oss_token)
-
-    # detect_path = os.path.abspath("detect.jpg")
-
-    # latest_face = Face.objects.order_by("-upload_time").first()
-    # print(Face.objects.count())
-    latest_face = Face.objects.first()
-    white_url = oss_download_url(latest_face.file.oss_token)
-    # oss_token = latest_face.file.oss_token
-    # white_path = detect_path.replace("detect.jpg", "white.jpg")
-    # oss_download(oss_token, white_path)
-    print("detect_url:", white_url)
-
-    
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        future_fire = executor.submit(detect_fire, detect_url)
-        future_smoke = executor.submit(detect_smoke, detect_url)
-        future_stranger = executor.submit(detect_stranger, detect_url, white_url)
-        future_rubbish = executor.submit(detect_rubbish, detect_url)
-
-        fire_flag = future_fire.result()
-        smoke_flag = future_smoke.result()
-        stranger_flag = future_stranger.result()
-        rubbish_flag = future_rubbish.result()
-    
-    if fire_flag:
-        oss_token = get_oss_token(0, "detect-fire.jpg")
-        oss_upload_local_file("detect.jpg", oss_token=oss_token)
-        file_obj = File.objects.create(
-            filename="detect-fire.jpg",
-            oss_token=oss_token,
-        )
-        Log.objects.create(
-            event_type=1,
-            detail="发现明火",
-            file=file_obj,
-            x=x,
-            y=y,
-        )
-
-    if smoke_flag:
-        oss_token = get_oss_token(0, "detect-smoke.jpg")
-        oss_upload_local_file("detect.jpg", oss_token=oss_token)
-        file_obj = File.objects.create(
-            filename="detect-smoke.jpg",
-            oss_token=oss_token,
-        )
-        Log.objects.create(
-            event_type=2,
-            detail="发现烟雾",
-            file=file_obj,
-            x=x,
-            y=y,
-        )
-
-    if stranger_flag:
-        oss_token = get_oss_token(0, "detect-stranger.jpg")
-        oss_upload_local_file("detect.jpg", oss_token=oss_token)
-        file_obj = File.objects.create(
-            filename="detect-stranger.jpg",
-            oss_token=oss_token,
-        )
-        Log.objects.create(
-            event_type=3,
-            detail="发现陌生人",
-            file=file_obj,
-            x=x,
-            y=y,
-        )
-    
-    if rubbish_flag:
-        oss_token = get_oss_token(0, "detect-rubbish.jpg")
-        oss_upload_local_file("detect.jpg", oss_token=oss_token)
-        file_obj = File.objects.create(
-            filename="detect-rubbish.jpg",
-            oss_token=oss_token,
-        )
-        Log.objects.create(
-            event_type=4,
-            detail="发现垃圾",
-            file=file_obj,
-            x=x,
-            y=y,
-        )
-
-    return success_api_response({
-        "fire": fire_flag,
-        "smoke": smoke_flag,
-        "stranger": stranger_flag,
-        "rubbish": rubbish_flag,
-    })
+        return success_api_response(dict.fromkeys(("fire", "smoke", "stranger", "rubbish"), False))
+    try:
+        pos = json.loads(request.POST.get("pos", "null"))
+    except json.JSONDecodeError as exc:
+        raise InvalidInputError("位置数据无效") from exc
+    if not isinstance(pos, list) or len(pos) != 3 or not all(is_finite_number(value) for value in pos):
+        raise InvalidInputError("请提供三个有限数值组成的位置坐标")
+    if not _detection_slots.acquire(blocking=False):
+        return failed_api_response(ErrorCode.TOO_MANY_REQUESTS, "识别任务繁忙，请稍后重试")
+    token = get_oss_token(0, "detect.jpg")
+    uploaded = False
+    retained = False
+    try:
+        with TemporaryDirectory(prefix="ros-detect-") as directory:
+            path = _save_jpeg(request.FILES.get("file"), directory)
+            oss_upload_local_file(path, token)
+            uploaded = True
+            url = oss_download_url(token)
+            face = Face.objects.filter(in_white_list=True).select_related("file").first()
+            futures = {
+                "fire": _executor.submit(detect_fire, url),
+                "smoke": _executor.submit(detect_smoke, url),
+                "rubbish": _executor.submit(detect_rubbish, url),
+            }
+            if face is not None:
+                futures["stranger"] = _executor.submit(detect_stranger, url, oss_download_url(face.file.oss_token))
+            # Wait for every reader before deleting its shared cloud image.
+            try:
+                flags = {name: future.result() for name, future in futures.items()}
+            finally:
+                for future in futures.values():
+                    try:
+                        future.result()
+                    except Exception:
+                        pass
+            flags.setdefault("stranger", None)
+            events = [
+                (1, "发现明火", flags["fire"]), (2, "发现烟雾", flags["smoke"]),
+                (3, "发现陌生人", flags["stranger"]), (4, "发现垃圾", flags["rubbish"]),
+            ]
+            if any(flag for _, _, flag in events):
+                with transaction.atomic():
+                    file_obj = File.objects.create(filename="detect.jpg", oss_token=token)
+                    Log.objects.bulk_create([
+                        Log(event_type=event_type, detail=detail, file=file_obj, x=pos[0], y=pos[1])
+                        for event_type, detail, flag in events if flag
+                    ])
+                retained = True
+            return success_api_response(flags)
+    finally:
+        if uploaded and not retained:
+            _remove_unreferenced_image(token)
+        _detection_slots.release()
 
 
-def log2dict(log: Log) -> dict:
+def log2dict(log):
+    if log is None:
+        return None
     return {
-        "id": log.id,
-        "event_type": log.event_type,
-        "detail": log.detail,
-        "time": log.time,
-        "x": log.x,
-        "y": log.y,
-        "url": oss_download_url(log.file.oss_token),
+        "id": log.id, "event_type": log.event_type, "detail": log.detail,
+        "time": log.time, "x": log.x, "y": log.y,
+        "url": oss_download_url(log.file.oss_token) if log.file_id else None,
     }
 
 
@@ -266,59 +167,55 @@ def log2dict(log: Log) -> dict:
 @require_jwt()
 @require_GET
 def get_log_list(request: HttpRequest):
-    """
-    [GET] /api/log/list
-    """
-    # Log.objects.all().delete()
-    logs = Log.objects.all().order_by("-id")
-    return success_api_response({"logs": list(map(log2dict, logs))})
+    try:
+        page = int(request.GET.get("page", 1))
+        page_size = int(request.GET.get("page_size", 50))
+    except (TypeError, ValueError) as exc:
+        raise InvalidInputError("分页参数无效") from exc
+    if page < 1 or not 1 <= page_size <= 100:
+        raise InvalidInputError("页码必须大于0，每页最多100条日志")
+    logs = Log.objects.select_related("file").order_by("-id")
+    total = logs.count()
+    offset = (page - 1) * page_size
+    return success_api_response({
+        "logs": [log2dict(log) for log in logs[offset:offset + page_size]],
+        "total": total, "page": page, "page_size": page_size,
+    })
 
 
 @response_wrapper
 @require_jwt()
 @require_GET
 def get_latest_log(request: HttpRequest):
-    """
-    [GET] /api/log/latest
-    """
-    log = Log.objects.all().order_by("-id").first()
-    return success_api_response({"log": log2dict(log)})
+    return success_api_response({"log": log2dict(Log.objects.select_related("file").order_by("-id").first())})
 
 
 @response_wrapper
 @require_jwt()
 @require_POST
 def begin_log(request: HttpRequest):
-    """
-    [GET] /api/log/begin
-    """
     global LOGFLAG
-    if not LOGFLAG:
+    with _log_lock:
+        if LOGFLAG:
+            return failed_api_response(ErrorCode.INVALID_REQUEST_ARGS, "日志记录已在进行中")
         LOGFLAG = True
-        return success_api_response({"message": "日志记录已开始"})
-    else:
-        return failed_api_response(ErrorCode.INVALID_REQUEST_ARGS, "日志记录已在进行中，请勿重复开始")
+    return success_api_response({"message": "日志记录已开始"})
+
 
 @response_wrapper
 @require_jwt()
 @require_POST
 def end_log(request: HttpRequest):
-    """
-    [GET] /api/log/end
-    """
     global LOGFLAG
-    if LOGFLAG:
+    with _log_lock:
+        if not LOGFLAG:
+            return failed_api_response(ErrorCode.INVALID_REQUEST_ARGS, "日志记录未开始")
         LOGFLAG = False
-        return success_api_response({"message": "日志记录已结束"})
-    else:
-        return failed_api_response(ErrorCode.INVALID_REQUEST_ARGS, "日志记录未开始，请勿重复结束")
+    return success_api_response({"message": "日志记录已结束"})
 
 
 @response_wrapper
 @require_jwt()
 @require_GET
 def get_log_flag(request: HttpRequest):
-    """
-    [GET] /api/log/flag
-    """
-    return success_api_response({'log': LOGFLAG})
+    return success_api_response({"log": LOGFLAG})

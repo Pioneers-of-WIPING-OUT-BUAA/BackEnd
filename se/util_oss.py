@@ -5,9 +5,10 @@ from uuid import uuid4
 from django.conf import settings
 from qcloud_cos import CosConfig, CosS3Client
 from qcloud_cos.cos_exception import CosClientError, CosServiceError
+from se.exceptions import ExternalServiceError
 
 
-class StorageError(RuntimeError):
+class StorageError(ExternalServiceError):
     pass
 
 

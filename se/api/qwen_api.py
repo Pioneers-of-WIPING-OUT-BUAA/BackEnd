@@ -2,9 +2,10 @@ from functools import lru_cache
 
 from django.conf import settings
 from openai import APIError, OpenAI
+from se.exceptions import ExternalServiceError
 
 
-class AIServiceError(RuntimeError):
+class AIServiceError(ExternalServiceError):
     pass
 
 
