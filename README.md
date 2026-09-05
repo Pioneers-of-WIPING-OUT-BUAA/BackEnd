@@ -1,5 +1,27 @@
 # 扫荡北航先锋-后端
 
+## 本地测试环境
+
+```bash
+conda env create -f environment.yml
+conda activate ros-buaa-backend
+cp config.example.yaml config.yaml
+# 在 config.yaml 中设置随机 DjangoSecretKey、OpenRouter 和 COS 凭据。
+python manage.py migrate
+python manage.py check
+pytest -q
+python manage.py runserver 127.0.0.1:8000
+```
+
+`config.yaml` 已被 Git 忽略。也可通过 `ROS_BUAA_CONFIG` 指定配置文件，
+或通过 `DJANGO_SECRET_KEY`、`OPENROUTER_API_KEY`、`OPENROUTER_MODEL` 覆盖对应字段。
+AI 请求使用 `https://openrouter.ai/api/v1`，默认模型为 `qwen/qwen3-vl-8b-instruct`，
+支持文本和图片，单次调用超时默认 25 秒。图片存储使用腾讯云 COS。
+自动测试替代外部 API，不消耗模型额度或写入真实存储桶。
+
+ROS 测试环境及消息编译方法见相邻 `RosEnd` 仓库的 `environment.yml` 和 README。
+本机需要代理时可先执行 `source /etc/profile.d/clash.sh`，再执行 `proxy_on`。
+
 本项目是"扫荡北航前锋"机器人项目的后端服务器，基于 Django REST Framework 构建。它不仅为前端应用提供了功能丰富的 API 接口，更重要的是，它扮演着连接用户与 ROS (机器人操作系统) 的核心桥梁，实现了对机器人的远程状态监控、任务下发与精细控制。
 
 ## 主要功能
@@ -52,8 +74,8 @@
 
 建议使用 `conda` 创建独立的 Python 环境，然后安装依赖：
 ```bash
-conda create -n ros_back python=3.10
-pip install -r requirements.txt
+conda env create -f environment.yml
+conda activate ros-buaa-backend
 ```
 
 ### 2. 项目配置

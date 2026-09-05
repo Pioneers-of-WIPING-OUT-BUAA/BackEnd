@@ -1,0 +1,12 @@
+Debug: true
+DjangoSecretKey: replace-with-a-random-local-secret
+ROSHOST: 127.0.0.1
+ROSPORT: 9090
+ROS_SERVICE_TIMEOUT: 5
+OPENROUTER_API_KEY: ""
+OPENROUTER_MODEL: qwen/qwen3-vl-8b-instruct
+OPENROUTER_TIMEOUT: 25
+COS_SECRET_ID: ""
+COS_SECRET_KEY: ""
+COS_REGION: ap-beijing
+COS_BUCKET_NAME: ""

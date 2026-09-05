@@ -14,27 +14,34 @@ from pathlib import Path
 
 import os
 import yaml
+from django.core.exceptions import ImproperlyConfigured
 
 # import pymysql
 # pymysql.install_as_MySQLdb()
 
-with open("config.yaml", "r") as s:
-    CONFIG = yaml.safe_load(s)
+BASE_DIR = Path(__file__).resolve().parent.parent
+CONFIG_PATH = Path(os.environ.get("ROS_BUAA_CONFIG", BASE_DIR / "config.yaml"))
+if CONFIG_PATH.exists():
+    with CONFIG_PATH.open(encoding="utf-8") as config_file:
+        CONFIG = yaml.safe_load(config_file) or {}
+else:
+    CONFIG = {}
+if not isinstance(CONFIG, dict):
+    raise ImproperlyConfigured("The configuration must be a YAML mapping.")
 
 LOGFLAG = False
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
-BASE_DIR = Path(__file__).resolve().parent.parent
-
-
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/4.2/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = CONFIG["DjangoSecretKey"]
+SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY") or CONFIG.get("DjangoSecretKey", "")
+if not SECRET_KEY:
+    raise ImproperlyConfigured("Set DJANGO_SECRET_KEY or DjangoSecretKey in config.yaml.")
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = CONFIG["Debug"]
+DEBUG = CONFIG.get("Debug", False)
 
 ALLOWED_HOSTS = ["*"]
 
@@ -144,19 +151,22 @@ CORS_ALLOW_ALL_ORIGINS = True
 CORS_ALLOW_HEADERS = ('*',)
 
 # oss相关配置
-OSS_SECRET_ID = CONFIG["OSS_SECRET_ID"]
-OSS_SECRET_KEY = CONFIG["OSS_SECRET_KEY"]
-OSS_ENDPOINT = CONFIG["OSS_ENDPOINT"]
-OSS_BUCKET_NAME = CONFIG["OSS_BUCKET_NAME"]
+OSS_SECRET_ID = CONFIG.get("OSS_SECRET_ID", "")
+OSS_SECRET_KEY = CONFIG.get("OSS_SECRET_KEY", "")
+OSS_ENDPOINT = CONFIG.get("OSS_ENDPOINT", "")
+OSS_BUCKET_NAME = CONFIG.get("OSS_BUCKET_NAME", "")
 
 # cos相关配置
-COS_SECRET_ID = CONFIG["COS_SECRET_ID"]
-COS_SECRET_KEY = CONFIG["COS_SECRET_KEY"]
-COS_REGION = CONFIG["COS_REGION"]  
-COS_BUCKET_NAME = CONFIG["COS_BUCKET_NAME"] 
+COS_SECRET_ID = CONFIG.get("COS_SECRET_ID", "")
+COS_SECRET_KEY = CONFIG.get("COS_SECRET_KEY", "")
+COS_REGION = CONFIG.get("COS_REGION", "ap-beijing")
+COS_BUCKET_NAME = CONFIG.get("COS_BUCKET_NAME", "")
 
 # ros相关配置
-ROS_HOST = CONFIG["ROSHOST"]
-ROS_PORT = CONFIG["ROSPORT"]
+ROS_HOST = CONFIG.get("ROSHOST", "127.0.0.1")
+ROS_PORT = int(CONFIG.get("ROSPORT", 9090))
+ROS_SERVICE_TIMEOUT = float(CONFIG.get("ROS_SERVICE_TIMEOUT", 5))
 
-LLM_API_KEY = CONFIG["LLM_API_KEY"]
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY") or CONFIG.get("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL") or CONFIG.get("OPENROUTER_MODEL", "qwen/qwen3-vl-8b-instruct")
+OPENROUTER_TIMEOUT = float(CONFIG.get("OPENROUTER_TIMEOUT", 25))
